@@ -1,0 +1,148 @@
+import pickle
+import gzip
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.model_selection import train_test_split
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import sobel
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+# Load the data
+def load_data():
+    path_to_train_data = 'flatland_train.data'
+    path_to_test_data = 'flatland_test.data'
+    
+    # Load training data
+    with gzip.open(path_to_train_data, 'rb') as f:
+        X_train, y_train = pickle.load(f)
+    
+    # Load testing data
+    with gzip.open(path_to_test_data, 'rb') as f:
+        X_test, y_test = pickle.load(f)
+    
+    return X_train, y_train, X_test, y_test
+
+X, y, X_p, y_p = load_data()
+
+# Normalize and convert the data to tensors
+X = tf.convert_to_tensor(X, dtype=tf.float32) / 255.0
+X_p = tf.convert_to_tensor(X_p, dtype=tf.float32) / 255.0
+
+# Function to apply Sobel edge detection with padding
+def apply_sobel_edges_with_padding(images, pad_width):
+    # Pad images
+    padded_images = tf.pad(images, [[0, 0], [pad_width, pad_width], [pad_width, pad_width]], mode='CONSTANT')
+
+    # Define Sobel kernels
+    sobel_x = tf.constant([[1, 0, -1], [2, 0, -2], [1, 0, -1]], dtype=tf.float32)
+    sobel_y = tf.constant([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=tf.float32)
+
+    # Reshape kernels to match the expected dimensions for Conv2D
+    sobel_x = tf.expand_dims(tf.expand_dims(sobel_x, axis=-1), axis=-1)  # Shape: (3, 3, 1, 1)
+    sobel_y = tf.expand_dims(tf.expand_dims(sobel_y, axis=-1), axis=-1)  # Shape: (3, 3, 1, 1)
+
+    # Apply Sobel filters using tf.nn.conv2d
+    gradient_x = tf.nn.conv2d(padded_images[..., tf.newaxis], sobel_x, strides=[1, 1, 1, 1], padding='VALID')
+    gradient_y = tf.nn.conv2d(padded_images[..., tf.newaxis], sobel_y, strides=[1, 1, 1, 1], padding='VALID')
+
+    # Compute the gradient magnitude
+    gradient_magnitude = tf.sqrt(tf.square(gradient_x) + tf.square(gradient_y))
+
+    return tf.squeeze(gradient_magnitude, axis=-1)
+
+# Apply Sobel edge detection
+pad_width = 1
+X_edges = apply_sobel_edges_with_padding(X, pad_width)
+X_p_edges = apply_sobel_edges_with_padding(X_p, pad_width)
+
+# Add channel dimension to the edge-detected images
+X_edges = np.expand_dims(X_edges, axis=-1)
+
+# Data augmentation
+train_datagen = ImageDataGenerator(
+    rotation_range=40,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+train_datagen.fit(X_edges)
+
+# Split data into train and test sets
+x_train, x_test, y_train, y_test = train_test_split(X_edges, y, test_size=0.2, random_state=42)
+
+# Build the model
+model = keras.Sequential()
+model.add(layers.Input(shape=(52, 52, 1)))
+
+# Define filter sizes and dropout rates for each layer
+layer_configs = [
+    {"filters": 16, "dropout": 0.2},
+    {"filters": 32, "dropout": 0.3},
+    {"filters": 64, "dropout": 0.4},
+    {"filters": 128, "dropout": 0.5}
+]
+
+# Add convolutional layers in a loop
+for config in layer_configs:
+    model.add(layers.Conv2D(config["filters"], (3, 3), activation='relu'))
+    model.add(layers.BatchNormalization())
+    model.add(layers.MaxPooling2D((2, 2)))
+    model.add(layers.Dropout(config["dropout"]))
+
+# Fully connected layers
+model.add(layers.Flatten())
+model.add(layers.Dense(128, activation='relu'))
+model.add(layers.Dropout(0.5))
+model.add(layers.Dense(10, activation='softmax'))
+
+# Compile model
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# Custom Callback for Printing Epoch Info
+class CustomEpochLogger(keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        accuracy = logs.get('accuracy')
+        loss = logs.get('loss')
+        print(f'Epoch {epoch + 1}: accuracy: {accuracy:.4f}, loss: {loss:.4f}')
+
+# Model checkpointing
+checkpoint_callback = ModelCheckpoint(
+    filepath='model_best.weights.h5',  # Ensure the filename ends with `.weights.h5`
+    monitor='val_accuracy',
+    save_best_only=True,
+    save_weights_only=True,
+    verbose=0  # Suppress model saving output to keep the desired output format
+)
+
+# Train the model
+train_generator = train_datagen.flow(
+    x_train,
+    y_train,
+    batch_size=32,
+    shuffle=True
+)
+
+model.fit(
+    train_generator,
+    epochs=55,  # Set the desired number of epochs
+    validation_data=(x_test, y_test),
+    callbacks=[checkpoint_callback, CustomEpochLogger()],  # Use both callbacks
+    verbose=0  # Suppress default epoch logging
+)
+
+# Evaluate the model
+test_loss, test_accuracy = model.evaluate(x_test, y_test, verbose=0)
+print(f'\nTest accuracy: {test_accuracy:.4f}')
+
+# Predict on X_p_edges and display predictions
+X_p_edges = np.expand_dims(X_p_edges, axis=-1)
+predictions = model.predict(X_p_edges)
+predicted_labels = [np.argmax(pred) for pred in predictions]
+formatted_predictions = ''.join([str(round(p)) for p in predicted_labels])
+print("Predicted labels:", formatted_predictions)
